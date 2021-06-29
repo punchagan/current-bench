@@ -223,7 +223,41 @@ Attaching to current-bench_db_1, current-bench_db-migrate_1, current-bench_pipel
 ...
 ```
 
-### Some errors you might run into
+## Database schema
+
+The benchmark results are stored in a single SQL table. Conceptually, the table is used as a key-value storage. With the key being the information needed to identify a single benchmark execution.
+
+The benchmark results are identified by:
+
+- Repository identifier (owner/name).
+- Benchmark build timestamp.
+- Current commit, PR and branch information.
+- OCurrent's image build job identifier.
+- OCurrent's container run job identifier.
+
+The payload contains:
+
+- JSON value with the results.
+
+
+### Benchmark status encoding
+
+The status of the benchmarking jobs is tracked in the database as a JSON value.
+
+The following table lists the possible status codes:
+
+| Status               | Description                         |
+|----------------------|-------------------------------------|
+| "Building"           | The build job started.              |
+| "Running"            | The run job started.                |
+| "Done"               | The run job completed successfully. |
+| ["Build_error", msg] | The build job failed.               |
+| ["Run_error", msg]   | The run job failed.                 |
+
+The errors will be written to the job's log when possible.
+
+
+## Some errors you might run into
 
 1. If docker cannot find the environment file, you have to provide the full path to the env file in the Makefile for the specific make target.
 2. If there's a `docker-compose` error, you need to upgrade `docker-compose` to the latest version.

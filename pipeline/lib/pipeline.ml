@@ -1,283 +1,181 @@
-open Current.Syntax
-module Git = Current_git
 module Github = Current_github
 module Docker = Current_docker.Default
-module Docker_util = Current_util.Docker_util
-module Slack = Current_slack
+module Git = Current_git
 module Logging = Logging
 module Benchmark = Models.Benchmark
-
-let ( >>| ) x f = Current.map f x
+module Config = Config
+open Current.Syntax
 
 module Source = struct
-  type github = {
-    token : Fpath.t;
-    slack_path : Fpath.t option;
-    repo : Github.Repo_id.t;
-  }
+  type github = { token : Fpath.t; repo : Github.Repo_id.t }
 
   type t = Github of github | Local of Fpath.t | Github_app of Github.App.t
 
-  let github ~token ~slack_path ~repo = Github { token; slack_path; repo }
+  let github ~token ~repo = Github { token; repo }
 
   let local path = Local path
 
   let github_app t = Github_app t
 end
 
-module Docker_config = struct
-  type t = { cpu : string option; numa_node : int option; shm_size : int }
-
-  let v ?cpu ?numa_node ~shm_size () = { cpu; numa_node; shm_size }
-end
-
 let pool = Current.Pool.create ~label:"docker" 1
 
-let read_channel_uri p =
-  Util.read_fpath p |> String.trim |> Uri.of_string |> Current_slack.channel
+let log_commit_info job commit_context =
+  let repo = Commit_context.repo_id_string commit_context in
+  let branch = Commit_context.branch commit_context in
+  let commit = Commit_context.hash commit_context in
+  Current.Job.log job "repo=%S branch=(%a) commit=%S" repo
+    Fmt.Dump.(option string)
+    branch commit
 
-(* Generate a Dockerfile for building all the opam packages in the build context. *)
-let dockerfile ~base ~repository =
-  let opam_dependencies =
-    (* FIXME: This should be supported by a custom Dockerfiles. *)
-    if String.equal repository "dune" then
-      "opam install ./dune-bench.opam -y --deps-only  -t"
-    else "opam install -y --deps-only -t ."
-  in
-  let open Dockerfile in
-  from (Docker.Image.hash base)
-  @@ run
-       "sudo apt-get update && sudo apt-get install -qq -yy libffi-dev \
-        liblmdb-dev m4 pkg-config gnuplot-x11 libgmp-dev libssl-dev \
-        libpcre3-dev"
-  @@ copy ~src:[ "--chown=opam:opam ." ] ~dst:"bench-dir" ()
-  @@ workdir "bench-dir"
-  @@ run "opam remote add origin https://opam.ocaml.org"
-  @@ run "%s" opam_dependencies
-  @@ add ~src:[ "--chown=opam ." ] ~dst:"." ()
-  @@ run "eval $(opam env)"
+let string_of_output output =
+  String.concat "\n" (List.map Yojson.Safe.pretty_to_string output)
 
-let weekly = Current_cache.Schedule.v ~valid_for:(Duration.of_day 7) ()
+let build_commit ~db commit_context =
+  Current.component "build"
+  |> let** commit_context = commit_context in
+     let commit = Commit_context.fetch commit_context in
+     let img = Engine.Docker_engine.build ~pool commit_context commit in
+     let current_job_id_opt = Current_util.get_job_id img in
+     let* job_id_opt = current_job_id_opt in
+     match job_id_opt with
+     | None ->
+         Fmt.epr "build job id not ready@.";
+         Current.pair img current_job_id_opt
+     | Some build_job_id ->
+         let () =
+           match Current.Job.lookup_running build_job_id with
+           | None -> Fmt.epr "build job %s is not running@." build_job_id
+           | Some job -> log_commit_info job commit_context
+         in
+         let repo_id_string = Commit_context.repo_id_string commit_context in
+         let branch = Commit_context.branch commit_context in
+         let pull_number = Commit_context.pull_number commit_context in
+         let commit = Commit_context.hash commit_context in
+         Storage.record_build_start ~repo_id:repo_id_string ~pull_number ~commit
+           ~branch ~build_job_id db;
+         Current.pair img current_job_id_opt
 
-let frontend_url = Sys.getenv "OCAML_BENCH_FRONTEND_URL"
+let run_commit ~db ~config ~commit_context ~build_job_id img =
+  Current.component "build"
+  |> let** commit_context = commit_context in
+     let info = Commit_context.show commit_context in
+     let output = Engine.Docker_engine.run ~info ~pool ~config img in
+     let* run_job_id_opt = Current_util.get_job_id output in
+     match run_job_id_opt with
+     | None ->
+         Fmt.epr "run job id not ready@.";
+         Current.return None
+     | Some run_job_id ->
+         let repo_id_string = Commit_context.repo_id_string commit_context in
+         let* output = Current.map Json_util.parse_many output in
+         Storage.record_run_finish ~repo_id_string ~build_job_id ~run_job_id
+           ~output db;
+         Current.return (Some output)
 
-(* $server/$repo_owner/$repo_name/pull/$pull_number *)
-let make_commit_status_url owner repository pull_number =
-  let uri_end =
-    match pull_number with
-    | None -> "/" ^ owner ^ "/" ^ repository
-    | Some number ->
-        "/" ^ owner ^ "/" ^ repository ^ "/pull/" ^ string_of_int number
-  in
-  Uri.of_string (frontend_url ^ uri_end)
-
-let github_status_of_state url = function
-  | Ok _ -> Github.Api.Status.v ~url `Success ~description:"Passed"
-  | Error (`Active _) -> Github.Api.Status.v ~url `Pending
-  | Error (`Msg m) -> Github.Api.Status.v ~url `Failure ~description:m
-
-let pipeline ~slack_path ~conninfo ?branch ?pull_number ~dockerfile ~tmpfs
-    ~docker_cpuset_cpus ~docker_cpuset_mems ~head ~repository ~owner () =
-  let repo_id = (owner, repository) in
-  let src =
-    match head with
-    | `Github api_commit ->
-        Git.fetch (Current.map Github.Api.Commit.id (Current.return api_commit))
-    | `Local commit -> commit
-  in
-  let current_image = Docker.build ~pool ~pull:false ~dockerfile (`Git src) in
-  let s =
-    let run_args =
-      [
-        "--security-opt";
-        "seccomp=./aslr_seccomp.json";
-        "--mount";
-        "type=volume,src=current-bench-data,dst=/home/opam/bench-dir/current-bench-data";
-      ]
-      @ tmpfs
-      @ docker_cpuset_cpus
-      @ docker_cpuset_mems
-    in
-    let run_at = Ptime_clock.now () in
-    let* commit =
-      match head with
-      | `Github api_commit -> Current.return (Github.Api.Commit.hash api_commit)
-      | `Local commit -> commit >>| Git.Commit.hash
-    in
-    let repo_info = owner ^ "/" ^ repository in
-    let current_output =
-      Docker_util.pread_log ~pool ~run_args current_image ~repo_info
-        ?pull_number ?branch ~commit
-        ~args:
-          [
-            "/usr/bin/setarch"; "x86_64"; "--addr-no-randomize"; "make"; "bench";
-          ]
-    in
-    let+ build_job_id = Current_util.get_job_id current_image
-    and+ run_job_id = Current_util.get_job_id current_output
-    and+ output = current_output in
-    let duration = Ptime.diff (Ptime_clock.now ()) run_at in
-    Logs.debug (fun log -> log "Benchmark output:\n%s" output);
-    let () =
-      let db = new Postgresql.connection ~conninfo () in
-      output
-      |> Json_util.parse_many
-      |> List.iter (fun output_json ->
-             let benchmark_name =
-               Yojson.Safe.Util.(member "name" output_json)
-               |> Yojson.Safe.Util.to_string_option
-             in
-             Yojson.Safe.Util.(member "results" output_json)
-             |> Yojson.Safe.Util.to_list
-             |> List.map
-                  (Benchmark.make ~duration ~run_at ~repo_id ~benchmark_name
-                     ~commit ?pull_number ?build_job_id ?run_job_id ?branch)
-             |> List.iter (Models.Benchmark.Db.insert db));
-      db#finish
-    in
-    match slack_path with Some p -> Some (p, output) | None -> None
-  in
-  s
-  |> Current.option_map (fun p ->
-         Current.component "post"
-         |> let** path, _ = p in
-            let channel = read_channel_uri path in
-            let output = Current.map snd p in
-            Slack.post channel ~key:"output" output)
-  |> Current.state
-  |> fun result ->
-  match head with
-  | `Local _ -> Current.ignore_value result
-  | `Github head ->
-      let status_url = make_commit_status_url owner repository pull_number in
-      result
-      >>| github_status_of_state status_url
-      |> Github.Api.Commit.set_status (Current.return head) "ocaml-benchmarks"
-      |> Current.ignore_value
-
-let process_pipeline ~(docker_config : Docker_config.t) ~conninfo
-    ~(source : Source.t) () =
-  let docker_cpuset_cpus =
-    match docker_config.cpu with
-    | Some cpu -> [ "--cpuset-cpus"; cpu ]
-    | None -> []
-  in
-  let docker_cpuset_mems =
-    match docker_config.numa_node with
-    | Some i -> [ "--cpuset-mems"; string_of_int i ]
-    | None -> []
-  in
-  let tmpfs =
-    match docker_config.numa_node with
-    | Some i ->
-        [
-          "--tmpfs";
-          Fmt.str "/dev/shm:rw,noexec,nosuid,size=%dg,mpol=bind:%d"
-            docker_config.shm_size i;
-        ]
+let monitor_commit ~db ~(config : Config.t) commit_context =
+  let build_state = build_commit ~db commit_context in
+  let img = Current.map fst build_state in
+  let* build_job_id_opt = Current.map snd build_state in
+  let* output =
+    match build_job_id_opt with
     | None ->
-        [
-          "--tmpfs";
-          Fmt.str "/dev/shm:rw,noexec,nosuid,size=%dg" docker_config.shm_size;
-        ]
+        Fmt.epr "build job id not ready@.";
+        Current.return None
+    | Some build_job_id ->
+        run_commit ~db ~config ~commit_context ~build_job_id img
   in
-  let pipeline =
-    pipeline ~conninfo ~tmpfs ~docker_cpuset_cpus ~docker_cpuset_mems
-  in
-  match source with
-  | Github { repo; slack_path; token } ->
-      let dockerfile =
-        let+ base = Docker.pull ~schedule:weekly "ocaml/opam" in
-        `Contents (dockerfile ~base ~repository:repo.name)
+  match output with
+  | None -> Current.return ()
+  | Some output ->
+      let* () =
+        Reporting.Slack.post ~path:config.slack_path
+          (Current.return (string_of_output output))
       in
-      let pipeline =
-        pipeline ~slack_path ~dockerfile ~repository:repo.name ~owner:repo.owner
-      in
-      let* refs =
-        let api =
-          token |> Util.read_fpath |> String.trim |> Current_github.Api.of_oauth
-        in
-        let repo = Current.return (api, repo) in
-        Current.component "Get PRs"
-        |> let> api, repo = repo in
-           Github.Api.refs api repo
-      in
-      let default_branch = Github.Api.default_ref refs in
-      let default_branch_name = Util.get_branch_name default_branch in
-      let ref_map = Github.Api.all_refs refs in
-      Github.Api.Ref_map.fold
-        (fun key head _ ->
-          let head = `Github head in
-          match key with
-          | `Ref branch ->
-              if branch = default_branch then
-                pipeline ~head ~branch:default_branch_name ()
-              else Current.return ()
-          | `PR pull_number -> pipeline ~head ~pull_number ()
-          (* Skip all branches other than master, and check PRs *))
-        ref_map (Current.return ())
-  | Local path ->
-      let dockerfile =
-        let+ base = Docker.pull ~schedule:weekly "ocaml/opam" in
-        `Contents (dockerfile ~base ~repository:"local")
-      in
-      let local = Git.Local.v path in
-      let* head = Git.Local.head local in
-      let head_commit = `Local (Git.Local.head_commit local) in
-      let branch =
-        match head with
-        | `Commit _ -> None
-        | `Ref git_ref -> (
-            match String.split_on_char '/' git_ref with
-            | [ _; _; branch ] -> Some branch
-            | _ ->
-                Logs.warn (fun log ->
-                    log "Could not extract branch name from: %s" git_ref);
-                None)
-      in
-      pipeline ?branch ~dockerfile ~head:head_commit ~repository:"local"
-        ~owner:"local" ~slack_path:None ()
-  | Github_app app ->
-      Github.App.installations app
-      |> Current.list_iter (module Github.Installation) @@ fun installation ->
-         let repos = Github.Installation.repositories installation in
-         repos
-         |> Current.list_iter ~collapse_key:"repo" (module Github.Api.Repo)
-            @@ fun repo ->
-            let* refs =
-              Current.component "Get PRS"
-              |> let> api, repo = repo in
-                 Github.Api.refs api repo
-            in
-            let ref_map = Github.Api.all_refs refs in
-            let default_branch = Github.Api.default_ref refs in
-            let default_branch_name = Util.get_branch_name default_branch in
-            let* _, repo = repo in
-            let dockerfile =
-              let+ base = Docker.pull ~schedule:weekly "ocaml/opam" in
-              `Contents (dockerfile ~base ~repository:repo.name)
-            in
-            let pipeline =
-              pipeline ~dockerfile ~slack_path:None ~repository:repo.name
-                ~owner:repo.owner
-            in
-            Github.Api.Ref_map.fold
-              (fun key head _ ->
-                let head = `Github head in
-                match key with
-                | `Ref branch ->
-                    if branch = default_branch then
-                      pipeline ~head ~branch:default_branch_name ()
-                    else Current.return ()
-                | `PR pull_number -> pipeline ~head ~pull_number ()
-                (* Skip all branches other than master, and check PRs *))
-              ref_map (Current.return ())
+      let* () = Reporting.Github.post commit_context (Current.return output) in
+      Current.return ()
 
-let v ~current_config ~docker_config ~server:mode ~(source : Source.t) conninfo
-    () =
-  Db_util.check_connection ~conninfo;
-  let pipeline = process_pipeline ~docker_config ~conninfo ~source in
-  let engine = Current.Engine.create ~config:current_config pipeline in
+module Github_pipeline = struct
+  let github_api_of_oauth_file token =
+    token |> Util.read_fpath |> String.trim |> Current_github.Api.of_oauth
+
+  let collect_commits repo =
+    let* refs =
+      Current.component "get-github-refs"
+      |> let> api, repo_id = repo in
+         Github.Api.refs api repo_id
+    in
+    let all_refs = Github.Api.all_refs refs in
+    let+ _, repo_id = repo in
+    let default_ref = Github.Api.default_ref refs in
+    Github.Api.Ref_map.fold
+      (fun ref commit acc ->
+        match ref with
+        | `PR pull_number ->
+            Commit_context.github ~commit ~repo_id ~pull_number () :: acc
+        | `Ref ref when String.equal ref default_ref ->
+            let branch = Util.branch_name_of_ref default_ref in
+            Commit_context.github ~commit ~repo_id ~branch () :: acc
+        | `Ref _ -> acc)
+      all_refs []
+
+  let monitor_repo ~db ~config repo =
+    repo
+    |> collect_commits
+    |> Current.list_iter (module Commit_context) (monitor_commit ~db ~config)
+
+  let monitor_installation ~db ~config installation =
+    installation
+    |> Github.Installation.repositories
+    |> Current.list_iter (module Github.Api.Repo) (monitor_repo ~db ~config)
+
+  let monitor_app ~db ~config app =
+    app
+    |> Github.App.installations
+    |> Current.list_iter
+         (module Github.Installation)
+         (monitor_installation ~db ~config)
+end
+
+module Local_pipeline = struct
+  let branch_of_head head =
+    match head with
+    | `Commit _ -> None
+    | `Ref git_ref -> (
+        match String.split_on_char '/' git_ref with
+        | [ _; _; branch ] -> Some branch
+        | _ -> None)
+
+  let make_commit_context repo_path =
+    let git = Git.Local.v repo_path in
+    let* head = Git.Local.head git in
+    let* commit = Git.Local.head_commit git in
+    let branch = branch_of_head head in
+    let commit_context = Commit_context.local ?branch ~repo_path ~commit () in
+    Current.return commit_context
+
+  let monitor_repo ~db ~config repo_path =
+    let commit_context = make_commit_context repo_path in
+    monitor_commit ~db ~config commit_context
+end
+
+let monitor ~db ~config (source : Source.t) =
+  match source with
+  | Github { repo; token } ->
+      let api = Github_pipeline.github_api_of_oauth_file token in
+      let repo = Current.return (api, repo) in
+      Github_pipeline.monitor_repo ~db ~config repo
+  | Local repo_path -> Local_pipeline.monitor_repo ~db ~config repo_path
+  | Github_app app -> Github_pipeline.monitor_app ~db ~config app
+
+let v ~(config : Config.t) ~server:mode ~(source : Source.t) () =
+  let db =
+    let conninfo = Uri.to_string config.db_uri in
+    new Postgresql.connection ~conninfo ()
+  in
+
+  let pipeline () = monitor ~db ~config source in
+  let engine = Current.Engine.create ~config:config.current pipeline in
   let routes =
     Routes.((s "webhooks" / s "github" /? nil) @--> Github.webhook)
     :: Current_web.routes engine
