@@ -239,12 +239,16 @@ let string_of_repositories repos =
   @@ List.map (fun r -> Repository.to_string r) repos
 
 let pull_requests_from_repositories repos =
-  List.filter_map
-    (fun r ->
-      match Repository.pull_number r with
-      | None -> None
-      | Some pull_number -> Some (Repository.info r, pull_number))
-    repos
+  let repos =
+    List.filter_map
+      (fun r ->
+        match Repository.pull_number r with
+        | None -> None
+        | Some pull_number -> Some (Repository.info r, pull_number))
+      repos
+  in
+  print_endline @@ Fmt.str "Repos count: %d" (List.length repos);
+  repos
 
 let process_pipeline ~config ~ocluster ~conninfo ~sources () =
   let repos = repositories sources in
