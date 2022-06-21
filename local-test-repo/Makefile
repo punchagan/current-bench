@@ -90,7 +90,3 @@ bench:
 	@echo "$$BENCH_DATA_B1_T1_B" | jq -M .
 	echo "Log message 4"
 	echo "Log message 5"
-	@echo "$$BENCH_DATA_B1_T2" | jq -M .
-	echo "Log message 6"
-	echo "Log message 7"
-	@echo "$$BENCH_DATA_3"
