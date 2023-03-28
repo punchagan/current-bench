@@ -10,6 +10,7 @@ type t = {
   github_api : Current_github.Api.t option;
   title : string option;
   labels : string list;
+  is_default_branch : bool option;
 }
 
 let default_src ?src commit =
@@ -18,7 +19,7 @@ let default_src ?src commit =
   | Some src -> src
 
 let v ~owner ~name ?src ~commit ?commit_message ?pull_number ?branch
-    ?github_head ?github_api ?title ~labels () =
+    ?github_head ?github_api ?title ~labels ?is_default_branch () =
   {
     owner;
     name;
@@ -31,6 +32,7 @@ let v ~owner ~name ?src ~commit ?commit_message ?pull_number ?branch
     src = default_src ?src commit;
     title;
     labels;
+    is_default_branch;
   }
 
 let owner t = t.owner
@@ -43,6 +45,7 @@ let pull_number t = t.pull_number
 let title t = t.title
 let labels t = t.labels
 let branch t = t.branch
+let is_default_branch t = t.is_default_branch
 let github_head t = t.github_head
 let github_api t = t.github_api
 let id t = (t.owner, t.name)

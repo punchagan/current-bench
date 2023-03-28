@@ -14,6 +14,7 @@ type repo = {
   build_args : string list; [@default []]
   notify_github : bool; [@default false]
   if_label : string option; [@default None]
+  branches : string list; [@default []]
 }
 [@@deriving yojson]
 
@@ -98,10 +99,21 @@ let default name =
     build_args = [];
     notify_github = false;
     if_label = None;
+    branches = [];
   }
 
-let must_benchmark repo conf =
-  match (conf.if_label, Repository.pull_number repo) with
+let must_benchmark_branch repo conf =
+  match Repository.pull_number repo with
+  | Some _ -> true
+  | _ -> (
+      match (conf.branches, Repository.branch repo) with
+      | (_ :: _ as branches), Some name -> List.mem name branches
+      | [], _ ->
+          Option.value ~default:false @@ Repository.is_default_branch repo
+      | _, _ -> false)
+
+let must_benchmark_pull repo conf =
+  match (conf.if_label, Repository.branch repo) with
   | Some tag, Some _ -> List.mem tag (Repository.labels repo)
   | _ -> true
 
@@ -109,7 +121,10 @@ let find t repo =
   let name = Repository.info repo in
   match List.filter (fun r -> r.name = name) t.repos with
   | [] -> [ default name ]
-  | configs -> List.filter (must_benchmark repo) configs
+  | configs ->
+      configs
+      |> List.filter (must_benchmark_pull repo)
+      |> List.filter (must_benchmark_branch repo)
 
 let find_image t image_name = Images.find image_name t.images
 
