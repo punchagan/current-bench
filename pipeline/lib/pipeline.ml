@@ -181,21 +181,28 @@ let github_repositories ~config repo =
         repository ~commit ~github_head:head ~commit_message:message
       in
       match key with
-      (* Skip all branches other than the default branch, and check PRs *)
-      | `Ref branch when branch = default_branch ->
-          repository ~branch:default_branch_name ~labels:[] () :: lst
+      | `Ref branch -> (
+          let branch = Util.get_branch_name branch in
+          let repository = repository ~branch ~labels:[] () in
+          match
+            List.filter
+              (Config.must_benchmark_branch ~default_branch:default_branch_name
+                 ~branch)
+              (Config.find config repository)
+          with
+          | [] -> lst
+          | _ -> repository :: lst)
       | `PR pr -> (
           let repository =
             repository ~title:pr.title ~pull_number:pr.id ~labels:pr.labels ()
           in
           match
             List.filter
-              (Config.must_benchmark repository)
+              (Config.must_benchmark_pull repository)
               (Config.find config repository)
           with
           | [] -> lst
-          | _ -> repository :: lst)
-      | _ -> lst)
+          | _ -> repository :: lst))
     ref_map []
 
 let filter_stale_repositories repos =
