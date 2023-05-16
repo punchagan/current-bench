@@ -14,7 +14,7 @@ define BENCH_DATA_B1_T1_A
 	},
 	{
 	  "name": "grammarFunctor/typing",
-	  "value": 0.28,
+	  "value": 0.2,
 	  "units": "secs",
 	  "trend": "lower-is-better"
 	},

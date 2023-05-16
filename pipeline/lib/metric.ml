@@ -288,6 +288,7 @@ let notify_metric_changes ~conninfo ~repository ~worker ~docker_image ~config
   match (pull_number, should_notify) with
   | Some pull_number, Some _ ->
       let job_id = Current.map (fun _ -> job_id_) output in
+      Logs.info (fun log -> log "Notifications enabled for %s ..." repo_id);
       notify ~conninfo ~repository ~worker ~docker_image ~pull_number job_id
   | None, _ -> Current.return "Not a pull request"
   | _, None ->
