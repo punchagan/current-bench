@@ -37,7 +37,7 @@ RUN apt-get update \
     ca-certificates \
     apt-transport-https \
     curl \
-    netcat \
+    ncat \
     postgresql-client \
     gnupg \
     lsb-release \

@@ -37,7 +37,7 @@ RUN apt-get update \
     ca-certificates \
     apt-transport-https \
     curl \
-    netcat \
+    ncat \
     gnupg \
     lsb-release \
     git \
