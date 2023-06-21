@@ -127,6 +127,8 @@ services:
     volumes:
       - ../capnp-secrets:/app/capnp-secrets
       - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock
+      - /var/lib/libvirt/images:/var/lib/libvirt/images
     depends_on:
       pipeline:
         condition: service_started
