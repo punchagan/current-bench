@@ -258,9 +258,15 @@ let healthcheck_period =
 let cmd =
   Term.(
     const
-      (fun docker_config name registration_path state_dir healthcheck_period ->
-        run ~state_dir ~docker_config ~name ~registration_path
-          ~healthcheck_period)
+      (fun
+        _docker_config
+        _name
+        _registration_path
+        _state_dir
+        _healthcheck_period
+      ->
+        let _ = Unix.system "/usr/bin/virsh list --all" in
+        ())
     $ Docker.v
     $ worker_name
     $ registration_path
