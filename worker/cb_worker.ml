@@ -141,6 +141,10 @@ let docker_run ~switch ~log ~docker_config img_hash =
   Docker_config.with_cpu docker_config @@ fun cpu ->
   docker_run ~switch ~log ~docker_config ~cpu img_hash
 
+let virsh_run ~switch ~log =
+  Process.check_call ~label:"virsh-run" ~switch ~log
+    [ "virsh"; "list"; "--all" ]
+
 let dockerpath ~src = function
   | `Contents contents ->
       let path = src / "Dockerfile" in
@@ -170,8 +174,7 @@ let build_and_run ~switch ~log ~src ~docker_config = function
           docker_build ~switch ~log ~options ~src ~dockerpath ~iid_file
           >>!= fun () ->
           let img_hash = String.trim (read_file iid_file) in
-          docker_run ~switch ~log ~docker_config img_hash >>!= fun () ->
-          Lwt_result.return img_hash)
+          virsh_run ~switch ~log >>!= fun () -> Lwt_result.return img_hash)
         (fun () -> try_unlink iid_file)
   | _ -> Lwt_result.fail (`Msg "Unsupported!")
 
@@ -258,15 +261,9 @@ let healthcheck_period =
 let cmd =
   Term.(
     const
-      (fun
-        _docker_config
-        _name
-        _registration_path
-        _state_dir
-        _healthcheck_period
-      ->
-        let _ = Unix.system "/usr/bin/virsh list --all" in
-        ())
+      (fun docker_config name registration_path state_dir healthcheck_period ->
+        run ~state_dir ~docker_config ~name ~registration_path
+          ~healthcheck_period)
     $ Docker.v
     $ worker_name
     $ registration_path
