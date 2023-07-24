@@ -375,3 +375,60 @@ dune exec --root=. ./cb_worker.exe -- \
 - The `--state-dir` should point to a directory where the worker will be able to store its data
 - The `--ocluster-pool` should be the filename created by the cluster.
 - Finally, the `--docker-cpu` is a comma separated list of CPUs available to the worker. If there are multiple choices `A,B,C` then the worker will be able to run as many benchmarks at the same time. If there are no comma, then only one benchmark will be run at a time. A range `A-B` allow for multicore benchmarks on the cpus A to B, while a single `X` cpu number is for a single core. If ranges are used, they should have the same number of CPUs and not overlap!
+
+### Production https configuration
+
+We run an nginx outside of Docker on port 80 and 443, with an initial `http`
+configuration in `/etc/nginx/conf.d/autumn.conf`:
+
+```
+server {
+    server_name autumn.ocamllabs.io;
+
+    location ~ ^/_hasura/(.*)$ {
+        proxy_pass "http://127.0.0.1:8080/$1";
+        proxy_set_header Host $http_host;
+    }
+
+    location / {
+        proxy_pass "http://localhost:8082/";
+        proxy_set_header Host $http_host;
+    }
+
+    listen 80;
+}
+```
+
+We do this despite having an nginx running inside the frontend Docker container, because:
+
+1. It's inconvenient to have certbot interact with this nginx server. Also we
+   want the "production" mode to be runnable on a local dev computer for
+   testing (which should not require certificates)
+2. The frontend queries the GraphQL server (Hasura) on port 8080 in http. This
+   is not allowed if the website is in https!
+
+
+We, then, run [certbot according to the instructions for
+nginx](https://certbot.eff.org/instructions?ws=nginx&os=ubuntufocal). It
+auto-detects that `autumn.ocamllabs.io` is registered with LetsEncrypt and tell
+you what to do!  Certbot modifies the configuration to a https enabled one.
+
+It also automatically adds a systemd timer to renew the certificates every 20h:
+
+```
+$ systemctl list-timers --all | grep certbot
+Wed 2021-12-22 23:11:00 GMT  11h left      Wed 2021-12-22 02:28:04 GMT  9h ago                snap.certbot.renew.timer     snap.certbot.renew.service
+```
+
+#### Potential improvements to the setup
+
+- OCurrent is running on port 8081 in http. GitHub webhooks are sent there. The
+  user can also access this website to consult the logs.
+
+  We tried the same `proxy_pass` trick as Hasura (in `/_ocurrent/`), but it
+  doesn't work as well: it notably breaks ocurrent css and the webhooks... but
+  it could be made to work!
+
+- Now that we have an always running nginx server, we could display a static
+  html "down for maintenance" when we deploy a new version of current-bench!
+  (nginx can detect that the proxy is down, and fallback to an other behavior)
